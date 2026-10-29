@@ -28,6 +28,7 @@ from app import pipeline
 log = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+MIN_SIDE = 128  # smallest accepted width/height in pixels
 
 # One restoration at a time: torch already uses every CPU core, so two at once only slow both down.
 _busy = threading.Lock()
@@ -55,6 +56,9 @@ async def restore(file: UploadFile = File(...)):
         image = _decode(data)
     except (OSError, ValueError, Image.DecompressionBombError):
         raise HTTPException(status_code=400, detail="That file is not a readable image.")
+    # Smaller images break the gate: a single 64x64 patch makes its ranking divide by zero.
+    if min(image.shape[:2]) < MIN_SIDE:
+        raise HTTPException(status_code=400, detail=f"Image is too small: both sides must be at least {MIN_SIDE} px.")
     return StreamingResponse(_stream(image, start), media_type="application/x-ndjson")
 
 
