@@ -1,35 +1,41 @@
 """The restoration recipe: image in, u-map and restored image out.
 
-Knows nothing about HTTP. Images are float32 HxWx3 numpy arrays in [0, 1].
+Knows nothing about HTTP. The public side is numpy (float32 in [0, 1]): restore() takes an
+HxWx3 image and yields an HxW u-map, then an HxWx3 restored image. Inside, everything is
+(N, C, H, W) torch tensors, the convention of tiling.py and gate.py.
 
-What this file expects from the other modules (they follow this, not the other way round):
-  app.models.{nafnet,umapnet,irsde}.load() -> fn(tile)
-      nafnet, irsde: HxWx3 float32 tile -> HxWx3 float32 tile
-      umapnet:       HxWx3 float32 tile -> HxW float32 map (already de-normalised)
-  app.tiling.tile_apply(image, fn, tile, stride, pad_multiple, needed=None)
-      `needed(y, x)` is optional. It gets a tile's top-left corner in the input image's
-      coordinates (so the padding must go on the bottom/right only) and returns False to
-      skip the tile; a skipped tile passes through unchanged and fn is not called on it.
-  app.gate.{classical_signal, rank_fuse, patch_gate}: as in tests/
-  app.config: TILE, STRIDE, PAD_MULTIPLE, PATCH, CUTOFF_PERCENTILE, W_LEARNED, W_CLASSICAL
+What this file expects from the other modules:
+  app.models.{nafnet,umapnet,irsde}.load() -> model_fn, as described in tiling.py
+      nafnet, irsde: (N, 3, H, W) -> (N, 3, H, W)
+      umapnet:       (N, 3, H, W) -> (N, 1, H, W)   (raw output, already de-normalised)
+  app.config: TILE_SIZE, OVERLAP, BATCH_SIZE, IRSDE_BATCH_SIZE
+The patch size, fusion weights and gate cutoff come from app.gate.
 """
-import numpy as np
+import torch
 
-from app.config import (
-    CUTOFF_PERCENTILE,
-    PAD_MULTIPLE,
-    PATCH,
-    STRIDE,
-    TILE,
-    W_CLASSICAL,
-    W_LEARNED,
+from app.config import BATCH_SIZE, IRSDE_BATCH_SIZE, OVERLAP, TILE_SIZE
+from app.gate import (
+    PATCH_SIZE,
+    blend,
+    compute_classical_signal,
+    compute_patch_weights,
+    fuse_signals,
+    get_flagged_patch_mask,
+    normalize_per_image,
+    upsample_patch_weights,
 )
-from app.gate import classical_signal, patch_gate, rank_fuse
 from app.models import irsde, nafnet, umapnet
-from app.tiling import tile_apply
+from app.tiling import (
+    pad_to_multiple,
+    run_model_on_tiles,
+    split_into_tiles,
+    stitch_tiles,
+    tiled_inference,
+    unpad,
+)
 
 _denoise = None  # NAFNet: noisy tile -> D_det tile
-_umap = None  # UMapNet: noisy tile -> uncertainty map
+_umap = None  # UMapNet: noisy tile -> uncertainty tile
 _diffuse = None  # IR-SDE: noisy tile -> D_gen tile
 
 
@@ -48,10 +54,11 @@ def warm_up():
     gate gives a blank image zero weight.
     """
     _require_loaded()
-    blank = np.zeros((TILE, TILE, 3), dtype=np.float32)
-    _denoise(blank)
-    _umap(blank)
-    _diffuse(blank)
+    blank = torch.zeros((1, 3, TILE_SIZE, TILE_SIZE))
+    with torch.no_grad():
+        _denoise(blank)
+        _umap(blank)
+        _diffuse(blank)
 
 
 def restore(image):
@@ -59,41 +66,56 @@ def restore(image):
     ("restored", HxWx3 array in [0, 1]). Both have the input's height and width.
     """
     _require_loaded()
-    h, w, _ = image.shape
+    x = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).contiguous()
+    # Pad once to a multiple of the gate's patch size and work on that padded image throughout,
+    # so the patch grid lines up with the pixels; crop back at the end.
+    padded, original_size = pad_to_multiple(x, PATCH_SIZE)
 
-    d_det = _tiled(image, _denoise)
-    # tile_apply only takes 3-channel tiles, so the 1-channel map is repeated and one channel kept
-    u_learned = _tiled(image, _umap_as_rgb)[..., 0]
-    u_classical = classical_signal(image, d_det)
-    u_map = rank_fuse(u_learned, u_classical, W_LEARNED, W_CLASSICAL)
-    yield "umap", u_map
+    d_det = _tiled(padded, _denoise, BATCH_SIZE)
+    u_learned = _tiled(padded, _umap, BATCH_SIZE)
+    u_classical = compute_classical_signal(padded, d_det)
+    combined = fuse_signals(normalize_per_image(u_learned), u_classical)
+    yield "umap", unpad(combined, original_size)[0, 0].numpy()
 
-    # patch_gate needs a multiple of PATCH; the padded rows/columns are cropped off again below
-    weights = patch_gate(_pad_to_multiple(u_map, PATCH), PATCH, CUTOFF_PERCENTILE)
-    if not weights.any():
-        yield "restored", np.clip(d_det, 0, 1)
+    patch_weights = compute_patch_weights(combined, patch_size=PATCH_SIZE)
+    flagged = get_flagged_patch_mask(patch_weights)[0, 0]
+    if not flagged.any():
+        yield "restored", _to_numpy(unpad(d_det, original_size))
         return
 
-    # Tiles start on multiples of STRIDE (a multiple of PATCH) and span whole patches, so a pixel
-    # with non-zero weight is only ever covered by tiles that are run, never by a skipped one.
-    def needed(y, x):
-        return weights[y // PATCH : -(-(y + TILE) // PATCH), x // PATCH : -(-(x + TILE) // PATCH)].any()
-
-    d_gen = _tiled(image, _diffuse, needed=needed)
-    w_pix = np.repeat(np.repeat(weights, PATCH, axis=0), PATCH, axis=1)[:h, :w, None]
-    yield "restored", np.clip((1 - w_pix) * d_det + w_pix * d_gen, 0, 1).astype(np.float32)
+    d_gen = _diffuse_flagged(padded, flagged)
+    weight_map = upsample_patch_weights(patch_weights, target_size=padded.shape[-2:])
+    yield "restored", _to_numpy(unpad(blend(d_det, d_gen, weight_map), original_size))
 
 
-def _tiled(image, fn, **kwargs):
-    return tile_apply(image, fn, tile=TILE, stride=STRIDE, pad_multiple=PAD_MULTIPLE, **kwargs)
+def _tiled(padded, model_fn, batch_size):
+    return tiled_inference(
+        padded, model_fn, tile_size=TILE_SIZE, overlap=OVERLAP, pad_multiple=PATCH_SIZE, batch_size=batch_size
+    )
 
 
-def _umap_as_rgb(tile):
-    return np.repeat(_umap(tile)[..., None], 3, axis=-1)
+def _diffuse_flagged(padded, flagged):
+    """Run IR-SDE only on tiles that touch a flagged patch; everywhere else d_gen stays zero.
+
+    A pixel with non-zero gate weight lies in a flagged patch, and every tile covering it
+    overlaps that patch, so it is always covered by a tile that was run. Rounding the patch
+    range outwards means a tile is never wrongly skipped, whatever its alignment.
+    """
+    tiles, coords = split_into_tiles(padded, TILE_SIZE, OVERLAP)
+    keep = [
+        i
+        for i, ((y, x), tile) in enumerate(zip(coords, tiles))
+        if flagged[
+            y // PATCH_SIZE : -(-(y + tile.shape[-2]) // PATCH_SIZE),
+            x // PATCH_SIZE : -(-(x + tile.shape[-1]) // PATCH_SIZE),
+        ].any()
+    ]
+    outputs = run_model_on_tiles(_diffuse, [tiles[i] for i in keep], batch_size=IRSDE_BATCH_SIZE)
+    return stitch_tiles(outputs, [coords[i] for i in keep], padded.shape[-2:], channels=3)
 
 
-def _pad_to_multiple(a, m):
-    return np.pad(a, ((0, -a.shape[0] % m), (0, -a.shape[1] % m)), mode="reflect")
+def _to_numpy(t):
+    return t.clamp(0, 1)[0].permute(1, 2, 0).contiguous().numpy()
 
 
 def _require_loaded():
