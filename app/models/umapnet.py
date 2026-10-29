@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from app.config import DEVICE
+
 DEFAULT_WEIGHTS = Path(__file__).resolve().parents[2] / "hf_weights" / "umap_generator.pt.zip"
 
 
@@ -49,17 +51,18 @@ def load(weights_path=DEFAULT_WEIGHTS):
     """Returns model_fn: (N, 3, H, W) in [0, 1] -> (N, 1, H, W) u-map in 0-255 units.
 
     H and W must be multiples of 8 (three 2x poolings).
+    The network runs on config.DEVICE; model_fn takes and returns CPU tensors.
     """
     ckpt = torch.load(weights_path, map_location="cpu", weights_only=True)
     net = UMapNet(ckpt["BASE"])
     net.load_state_dict({k.removeprefix("module."): v for k, v in ckpt["model"].items()}, strict=True)
-    net = net.float().eval()
+    net = net.float().eval().to(DEVICE)
     t_mean, t_std, eps = ckpt["T_MEAN"], ckpt["T_STD"], ckpt["EPS"]
 
     def model_fn(x):
         if x.shape[-2] % 8 or x.shape[-1] % 8:
             raise ValueError(f"UMapNet needs H and W to be multiples of 8, got {tuple(x.shape[-2:])}")
         # Same as the notebook's denorm_u, which works in float64; float32 differs by far less than a grey level.
-        return torch.sqrt(torch.clamp(torch.exp(net(x) * t_std + t_mean) - eps, min=0.0))
+        return torch.sqrt(torch.clamp(torch.exp(net(x.to(DEVICE)) * t_std + t_mean) - eps, min=0.0)).cpu()
 
     return model_fn

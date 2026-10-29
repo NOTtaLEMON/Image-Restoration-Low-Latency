@@ -19,10 +19,14 @@ Where IR-SDE runs: only on flagged 64x64 PATCHES, not on whole tiles. A patch is
 Each flagged patch is restored from an IRSDE_WINDOW-sized window around it (context for the
 model), and only the patch's own 64x64 centre is kept.
 """
+import logging
+import time
+
 import torch
 import torch.nn.functional as F
 
 from app.config import (
+    DEVICE,
     BATCH_SIZE,
     GATE_CUTOFF,
     IRSDE_BATCH_SIZE,
@@ -43,6 +47,9 @@ from app.gate import (
 )
 from app.models import irsde, nafnet, umapnet
 from app.tiling import pad_to_multiple, run_model_on_tiles, tiled_inference, unpad
+
+# uvicorn's logger, so the per-stage timings appear in the server's console / log file.
+log = logging.getLogger("uvicorn.error")
 
 _denoise = None  # NAFNet: noisy tile -> D_det tile
 _umap = None  # UMapNet: noisy tile -> uncertainty tile
@@ -80,10 +87,17 @@ def restore(image):
     # so the patch grid lines up with the pixels; crop back at the end.
     padded, original_size = pad_to_multiple(x, PATCH_SIZE)
 
+    t0 = time.perf_counter()
     d_det = _tiled(padded, _denoise, BATCH_SIZE)
+    t_nafnet = time.perf_counter()
     u_learned = _tiled(padded, _umap, BATCH_SIZE)
+    t_umapnet = time.perf_counter()
     u_classical = compute_classical_signal(padded, d_det)
     combined = fuse_signals(normalize_per_image(u_learned), u_classical)
+    log.info(
+        "%dx%d on %s: NAFNet %.1f s, UMapNet %.1f s",
+        *original_size, DEVICE, t_nafnet - t0, t_umapnet - t_nafnet,
+    )
     yield "umap", unpad(combined, original_size)[0, 0].numpy()
 
     patch_weights = compute_patch_weights(combined, patch_size=PATCH_SIZE, percentile_cutoff=GATE_CUTOFF)
@@ -94,10 +108,16 @@ def restore(image):
 
     flagged = get_flagged_patch_mask(patch_weights)[0, 0]
     if not flagged.any():
+        log.info("IR-SDE: no flagged patches, skipped")
         yield "restored", _to_numpy(unpad(d_det, original_size))
         return
 
+    t_irsde = time.perf_counter()
     d_gen = _diffuse_patches(padded, flagged, original_size)
+    log.info(
+        "IR-SDE: %d of %d patches in %.1f s",
+        int(flagged.sum()), flagged.numel(), time.perf_counter() - t_irsde,
+    )
     weight_map = upsample_patch_weights(patch_weights, target_size=padded.shape[-2:])
     yield "restored", _to_numpy(unpad(blend(d_det, d_gen, weight_map), original_size))
 

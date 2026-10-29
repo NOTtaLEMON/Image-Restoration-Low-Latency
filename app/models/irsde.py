@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 
+from app.config import DEVICE
 from app.models._irsde_arch.DenoisingNAFNet_arch import ConditionalNAFNet
 from app.models._irsde_arch.sde import IRSDE
 
@@ -34,7 +35,9 @@ def load(weights_path=DEFAULT_WEIGHTS, steps=SDE["T"]):
     state = torch.load(weights_path, map_location="cpu", weights_only=True)
     state = state.get("params", state.get("state_dict", state))
     net.load_state_dict({k.removeprefix("module."): v for k, v in state.items()}, strict=True)
-    net = net.float().eval()
+    # The network runs on config.DEVICE; model_fn takes and returns CPU tensors. The SDE's
+    # schedule stays on the CPU: it is only indexed to single numbers, which mix with GPU tensors.
+    net = net.float().eval().to(DEVICE)
 
     sde = IRSDE(max_sigma=SDE["max_sigma"], T=steps, schedule=SDE["schedule"], eps=SDE["eps"])
     if steps == SDE["T"]:
@@ -44,7 +47,8 @@ def load(weights_path=DEFAULT_WEIGHTS, steps=SDE["T"]):
         sde.set_model(lambda x, mu, t: net(x, mu, t * scale))
 
     def model_fn(x):
+        x = x.to(DEVICE)
         sde.set_mu(x)
-        return sde.reverse_sde(sde.noise_state(x)).clamp(0, 1)
+        return sde.reverse_sde(sde.noise_state(x)).clamp(0, 1).cpu()
 
     return model_fn
