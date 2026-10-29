@@ -242,9 +242,9 @@ async function readStream(response) {
 }
 
 // ---- Device notice ---------------------------------------------------------------------
-// GET /info returns {"device": "cuda"} or {"device": "cpu"}. CPU means this copy runs on a
-// machine without a GPU (typically someone's own laptop, used when the hosted GPU link is down),
-// so the page sets expectations: the u-map is quick, the full restoration takes minutes.
+// GET /info returns {"device": "cuda"} or {"device": "cpu"}. CPU means the server has no GPU
+// (someone's own laptop, or the free hosted Space), so the page sets expectations: the u-map
+// is quick, the full restoration takes minutes.
 
 let onCpu = false;
 
@@ -254,8 +254,8 @@ async function showDeviceNote() {
     onCpu = device !== "cuda";
     const note = $("device-note");
     $("device-text").textContent = onCpu
-      ? "Running on this computer's CPU: no GPU was found on this machine, so each restoration " +
-        "takes about 3+ minutes. The u-map still appears within seconds."
+      ? "Running on a CPU: no GPU is available on this machine, so each restoration takes " +
+        "3+ minutes. The u-map still appears within seconds."
       : "Running on a GPU.";
     note.classList.toggle("is-cpu", onCpu);
     note.hidden = false;
@@ -294,7 +294,7 @@ form.addEventListener("submit", async (event) => {
 
   button.disabled = true;
   button.classList.add("is-busy");
-  setStatus(onCpu ? "Uploading... CPU mode (no GPU on this machine): expect about 3+ minutes." : "Uploading...");
+  setStatus(onCpu ? "Uploading... CPU mode (no GPU available): expect 3+ minutes." : "Uploading...");
   startTicker();
 
   try {

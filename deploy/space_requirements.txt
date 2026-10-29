@@ -1,0 +1,13 @@
+# Packages for the Hugging Face Space (Gradio SDK, ZeroGPU hardware). Uploaded to the Space as
+# its requirements.txt; the laptop keeps using the repo's own requirements.txt.
+# torch comes from the default index (the CUDA build), which ZeroGPU needs. `spaces` provides the
+# @spaces.GPU decorator used in app.py. No version floors: the Space's preinstalled Gradio pins
+# fastapi/uvicorn/numpy, and these must stay compatible with it.
+spaces
+torch
+numpy
+fastapi
+uvicorn
+python-multipart
+pillow
+huggingface_hub
