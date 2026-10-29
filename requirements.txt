@@ -1,0 +1,19 @@
+# Python dependencies. Lower bounds are the versions this was tested with (Python 3.14, CPU only).
+# Install with:  pip install -r requirements.txt
+# On Windows/Linux, plain "pip install torch" gives the CPU build, which is what this app uses.
+
+# Models and tensor maths (app/models, app/tiling.py, app/gate.py, app/pipeline.py)
+torch>=2.11
+numpy>=2.3
+
+# Web server (app/main.py)
+fastapi>=0.135
+uvicorn>=0.43
+python-multipart>=0.0.22   # needed by FastAPI to read the uploaded file
+pillow>=12.2               # decode the upload, encode the PNG results
+
+# Fetching model weights from Hugging Face (scripts/download_weights.py, once it is written)
+huggingface_hub>=1.9
+
+# Tests (tests/)
+pytest>=9.1
