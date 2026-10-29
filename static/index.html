@@ -61,6 +61,12 @@
         <span class="bay-number" aria-hidden="true">02</span>
         <h2 id="status-heading" class="label">Status</h2>
 
+        <!-- Device notice: filled in by app.js from GET /info (hidden if the server does not answer). -->
+        <p class="device-note" id="device-note" hidden>
+          <span class="lamp" id="device-lamp" aria-hidden="true"></span>
+          <span id="device-text"></span>
+        </p>
+
         <div class="screen">
           <ol class="steps" id="steps">
             <li data-step="denoise"><span class="lamp" aria-hidden="true"></span>Denoise<span class="step-state">waiting</span></li>

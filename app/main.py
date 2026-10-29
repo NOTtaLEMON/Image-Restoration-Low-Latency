@@ -29,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 
 from app import pipeline
+from app.config import DEVICE
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +52,12 @@ async def lifespan(app):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/info")
+def info():
+    """Where the models run ("cuda" or "cpu"); the page uses it to warn about slow CPU runs."""
+    return {"device": DEVICE}
 
 
 @app.post("/restore")

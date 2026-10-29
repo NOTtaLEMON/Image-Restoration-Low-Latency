@@ -241,6 +241,31 @@ async function readStream(response) {
   if (rest) handleMessage(JSON.parse(rest));
 }
 
+// ---- Device notice ---------------------------------------------------------------------
+// GET /info returns {"device": "cuda"} or {"device": "cpu"}. CPU means this copy runs on a
+// machine without a GPU (typically someone's own laptop, used when the hosted GPU link is down),
+// so the page sets expectations: the u-map is quick, the full restoration takes minutes.
+
+let onCpu = false;
+
+async function showDeviceNote() {
+  try {
+    const { device } = await (await fetch("/info")).json();
+    onCpu = device !== "cuda";
+    const note = $("device-note");
+    $("device-text").textContent = onCpu
+      ? "Running on this computer's CPU: no GPU was found on this machine, so each restoration " +
+        "takes about 3+ minutes. The u-map still appears within seconds."
+      : "Running on a GPU.";
+    note.classList.toggle("is-cpu", onCpu);
+    note.hidden = false;
+  } catch {
+    // Older server without /info, or offline: leave the notice hidden.
+  }
+}
+
+showDeviceNote();
+
 // ---- The upload ------------------------------------------------------------------------
 
 let originalUrl = null; // object URL of the chosen file; released when a new one is chosen
@@ -269,7 +294,7 @@ form.addEventListener("submit", async (event) => {
 
   button.disabled = true;
   button.classList.add("is-busy");
-  setStatus("Uploading...");
+  setStatus(onCpu ? "Uploading... CPU mode (no GPU on this machine): expect about 3+ minutes." : "Uploading...");
   startTicker();
 
   try {

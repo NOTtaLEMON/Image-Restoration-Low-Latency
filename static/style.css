@@ -359,6 +359,20 @@ h1 {
 }
 .status.is-warning { color: #ffb08f; }
 
+.device-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: var(--dp-spacing-compact-gap) 0 0;
+  padding: 10px 14px;
+  border-radius: var(--dp-radius-key);
+  background: var(--dp-color-raised);
+  box-shadow: var(--raised-shadow);
+  font-size: var(--dp-typography-reading);
+}
+.device-note .lamp { margin-top: 6px; }
+.device-note.is-cpu .lamp { background: var(--dp-color-accent); box-shadow: 0 0 6px rgba(241, 91, 34, 0.8); }
+
 .error-bar {
   display: flex;
   flex-wrap: wrap;
