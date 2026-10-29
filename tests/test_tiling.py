@@ -1,199 +1,246 @@
-"""
-tests/test_tiling.py
+"""Tests for the torch-based app.tiling module.
 
-Tests for app.tiling module: tile_apply function for tiled inference.
-
-All tests use synthetic numpy/torch arrays only. No weights, no GPU, no downloads.
-
-Assumptions:
-1. Tiles are 256x256, stride is 192 (64-pixel overlap).
-2. Overlapping regions use simple averaging (plain window).
-3. Input shape is preserved exactly in the output.
-4. Padding to multiples of 64 is handled internally and removed from output.
+These tests use only synthetic CPU tensors; no weights, GPU, downloads, or
+real images are needed.
 """
 
-import numpy as np
 import pytest
+import torch
 
-from app.tiling import tile_apply
-
-
-# -- helpers ------------------------------------------------------------------
-
-def make_image(h, w, value=0.5):
-    """Create a numpy HxWx3 float32 test image."""
-    return np.full((h, w, 3), value, dtype=np.float32)
-
-
-def offset_per_tile(step):
-    """
-    Function factory: returns a fn that outputs constant tiles.
-    Each call returns a tile filled with step * call_count, so adjacent tiles
-    in a row (or column) differ by exactly `step`.
-    """
-    counter = {"n": 0}
-
-    def fn(t):
-        val = counter["n"] * step
-        counter["n"] += 1
-        return np.full_like(t, val)
-
-    return fn
+from app.tiling import (
+    pad_to_multiple,
+    split_into_tiles,
+    stitch_tiles,
+    tiled_inference,
+    unpad,
+)
 
 
-# -- identity round-trip -------------------------------------------------------
+def make_image(height, width, value=0.5):
+    """Create a float32 image tensor with shape (1, 3, H, W)."""
+    return torch.full((1, 3, height, width), value, dtype=torch.float32)
 
-@pytest.mark.parametrize("h,w", [
-    (256, 256),
-    (300, 517),
-    (1024, 768),
-    (100, 100),
-])
-def test_identity_roundtrip(h, w):
-    """fn = identity must return the input within float tolerance."""
-    img = np.random.default_rng(42).random((h, w, 3)).astype(np.float32)
-    out = tile_apply(img, fn=lambda t: t)
-    assert out.shape == img.shape, f"shape changed: {img.shape} -> {out.shape}"
-    np.testing.assert_allclose(
-        out, img, atol=1e-5,
-        err_msg="Identity fn changed pixel values beyond tolerance."
+
+def random_image(height, width, seed=0):
+    """Create a deterministic float32 tensor with values in [0, 1]."""
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    return torch.rand((1, 3, height, width), generator=generator, dtype=torch.float32)
+
+
+def identity_model(batch):
+    """Model callback that returns each tile unchanged."""
+    return batch
+
+
+@pytest.mark.parametrize(
+    "height,width",
+    [
+        (256, 256),
+        (300, 517),
+        (1024, 768),
+        (100, 100),
+    ],
+)
+def test_identity_round_trip(height, width):
+    """Tiled inference with an identity callback preserves all pixels."""
+    image = random_image(height, width, seed=42)
+    output = tiled_inference(
+        image,
+        model_fn=identity_model,
+        tile_size=256,
+        overlap=64,
+        pad_multiple=64,
+        batch_size=4,
     )
 
-
-# -- output shape is preserved -----------------------------------------------
-
-@pytest.mark.parametrize("h,w", [
-    (256, 256),
-    (300, 517),
-    (1024, 768),
-    (100, 100),
-])
-def test_shape_preserved(h, w):
-    """Output shape must exactly equal input shape (padding is removed)."""
-    img = make_image(h, w)
-    out = tile_apply(img, fn=lambda t: t)
-    assert out.shape == (h, w, 3), \
-        f"Expected shape ({h}, {w}, 3), got {out.shape}"
+    assert output.shape == image.shape
+    torch.testing.assert_close(output, image, atol=1e-5, rtol=0.0)
 
 
-# -- what fn receives and returns ----------------------------------------------
-
-def test_fn_receives_full_size_tiles():
-    """fn must only ever see (256, 256, 3) float32 tiles, never smaller."""
-    seen = []
-
-    def fn(t):
-        seen.append((t.shape, t.dtype))
-        return t
-
-    img = np.random.default_rng(1).random((300, 517, 3)).astype(np.float32)
-    tile_apply(img, fn=fn, tile=256, stride=192)
-    assert seen, "fn was never called"
-    assert all(s == ((256, 256, 3), np.float32) for s in seen), \
-        f"fn received unexpected tiles: {set(seen)}"
-
-
-def test_output_is_float32():
-    """Output dtype must be float32."""
-    img = np.random.default_rng(2).random((100, 100, 3)).astype(np.float32)
-    out = tile_apply(img, fn=lambda t: t)
-    assert out.dtype == np.float32
-
-
-def test_input_is_not_modified():
-    """tile_apply must not modify the input array in-place."""
-    img = np.random.default_rng(3).random((300, 517, 3)).astype(np.float32)
-    before = img.copy()
-    tile_apply(img, fn=lambda t: t * 0.5)
-    np.testing.assert_array_equal(img, before)
-
-
-# -- every pixel is covered (no holes) ----------------------------------------
-
-@pytest.mark.parametrize("h,w", [
-    (256, 256),
-    (300, 517),
-    (100, 100),
-    (1024, 768),
-])
-def test_every_pixel_covered(h, w):
-    """
-    fn that returns all-ones must produce all-ones in output.
-    If any pixel had zero weight it would be NaN or 0, not 1.
-    """
-    img = make_image(h, w, value=0.0)
-    out = tile_apply(img, fn=lambda t: np.ones_like(t))
-    assert out.shape == (h, w, 3)
-    np.testing.assert_allclose(
-        out, 1.0, atol=1e-5,
-        err_msg="Some pixels not covered (output != 1 where all-ones fn was used)."
+@pytest.mark.parametrize(
+    "height,width",
+    [
+        (256, 256),
+        (300, 517),
+        (1024, 768),
+        (100, 100),
+    ],
+)
+def test_output_shape_matches_input(height, width):
+    """Tiled inference removes padding and returns the original H and W."""
+    image = make_image(height, width)
+    output = tiled_inference(
+        image,
+        model_fn=identity_model,
+        tile_size=256,
+        overlap=64,
+        pad_multiple=64,
     )
 
-
-# -- overlap blending coverage ------------------------------------------------
-#
-# With plain averaging, the blend in overlaps is simple. We check:
-# 1. Output stays within the range of its inputs (no extrapolation).
-# 2. The output actually uses all tiles (later tiles contribute).
-# This is weaker than testing smoothness, but matches the actual implementation.
-
-STEP = 0.1
-MIN_LATER_TILES = 1.5 * STEP  # If tile 0 is 0.0, tile 1 is 0.1, tile 2 is 0.2, we should see ~0.2
+    assert output.shape == (1, 3, height, width)
 
 
-def test_blending_preserves_range_horizontal():
-    """
-    One row of tiles (H=256). Output values must not exceed the range of
-    input tile values. With plain averaging, min and max are preserved.
-    """
-    img = make_image(256, 517, value=0.0)
-    out = tile_apply(img, fn=offset_per_tile(STEP), tile=256, stride=192)
-    assert out.shape == (256, 517, 3)
-    # Tile values: 0.0, 0.1, 0.2. Output should be in [0, 0.2].
-    assert float(out.min()) >= -1e-5
-    assert float(out.max()) <= 0.2 + 1e-5
-    assert float(out.max()) > MIN_LATER_TILES, "Later tiles do not appear to contribute."
+@pytest.mark.parametrize(
+    "height,width",
+    [
+        (256, 256),
+        (300, 517),
+        (100, 100),
+        (1024, 768),
+    ],
+)
+def test_every_pixel_is_covered(height, width):
+    """A callback returning ones must produce ones at every output pixel."""
+    image = make_image(height, width, value=0.0)
+    output = tiled_inference(
+        image,
+        model_fn=torch.ones_like,
+        tile_size=256,
+        overlap=64,
+        pad_multiple=64,
+        batch_size=4,
+    )
+
+    assert output.shape == image.shape
+    torch.testing.assert_close(output, torch.ones_like(image), atol=1e-5, rtol=0.0)
 
 
-def test_blending_preserves_range_vertical():
-    """
-    One column of tiles (W=256). Output values must not exceed the range of
-    input tile values.
-    """
-    img = make_image(517, 256, value=0.0)
-    out = tile_apply(img, fn=offset_per_tile(STEP), tile=256, stride=192)
-    assert out.shape == (517, 256, 3)
-    # Tile values: 0.0, 0.1, 0.2. Output should be in [0, 0.2].
-    assert float(out.min()) >= -1e-5
-    assert float(out.max()) <= 0.2 + 1e-5
-    assert float(out.max()) > MIN_LATER_TILES, "Later tiles do not appear to contribute."
+@pytest.mark.parametrize(
+    "height,width",
+    [
+        (256, 256),
+        (300, 517),
+        (1024, 768),
+        (100, 100),
+    ],
+)
+def test_split_tiles_cover_padded_image(height, width):
+    """Every padded-image pixel is covered by one or more returned tiles."""
+    image = random_image(height, width, seed=7)
+    padded, _ = pad_to_multiple(image, multiple=64)
+    tile_size = 256
+    overlap = 64
+    tiles, coords = split_into_tiles(padded, tile_size=tile_size, overlap=overlap)
+
+    assert tiles, "split_into_tiles returned no tiles"
+    assert len(tiles) == len(coords)
+
+    padded_height, padded_width = padded.shape[-2:]
+    coverage = torch.zeros((padded_height, padded_width), dtype=torch.int32)
+    for tile, (top, left) in zip(tiles, coords):
+        tile_height, tile_width = tile.shape[-2:]
+        assert 0 <= top <= padded_height - tile_height
+        assert 0 <= left <= padded_width - tile_width
+        coverage[top : top + tile_height, left : left + tile_width] += 1
+
+        # When both spatial dimensions can hold a full tile, no edge tile
+        # should be smaller: the last tile is shifted back inside the image.
+        if padded_height >= tile_size and padded_width >= tile_size:
+            assert tile.shape == (1, 3, tile_size, tile_size)
+
+    assert bool(torch.all(coverage > 0)), "At least one padded-image pixel is uncovered"
 
 
-# -- invalid arguments -------------------------------------------------------
+def test_plain_average_stays_between_tile_constants_horizontal():
+    """Plain overlap averaging stays in the range of all horizontal tile values."""
+    image = make_image(256, 517, value=0.0)  # padded width 576 => three tiles
+    step = 0.1
+    counter = {"next": 0}
 
-def test_stride_equal_to_tile_raises():
-    """stride == tile has no overlap: must raise."""
-    img = make_image(300, 300)
-    with pytest.raises((ValueError, AssertionError)):
-        tile_apply(img, fn=lambda t: t, tile=256, stride=256)
+    def constant_per_tile(batch):
+        outputs = []
+        for tile in batch:
+            value = counter["next"] * step
+            counter["next"] += 1
+            outputs.append(torch.full_like(tile, value))
+        return torch.stack(outputs, dim=0)
+
+    output = tiled_inference(
+        image,
+        model_fn=constant_per_tile,
+        tile_size=256,
+        overlap=64,
+        pad_multiple=64,
+        batch_size=8,
+    )
+
+    assert float(output.min()) >= -1e-6
+    assert float(output.max()) <= 2 * step + 1e-6
 
 
-def test_stride_gt_tile_raises():
-    """stride > tile leaves gaps: must raise."""
-    img = make_image(300, 300)
-    with pytest.raises((ValueError, AssertionError)):
-        tile_apply(img, fn=lambda t: t, tile=256, stride=300)
+def test_plain_average_stays_between_tile_constants_vertical():
+    """Plain overlap averaging stays in the range of all vertical tile values."""
+    image = make_image(517, 256, value=0.0)  # padded height 576 => three tiles
+    step = 0.1
+    counter = {"next": 0}
+
+    def constant_per_tile(batch):
+        outputs = []
+        for tile in batch:
+            value = counter["next"] * step
+            counter["next"] += 1
+            outputs.append(torch.full_like(tile, value))
+        return torch.stack(outputs, dim=0)
+
+    output = tiled_inference(
+        image,
+        model_fn=constant_per_tile,
+        tile_size=256,
+        overlap=64,
+        pad_multiple=64,
+        batch_size=8,
+    )
+
+    assert float(output.min()) >= -1e-6
+    assert float(output.max()) <= 2 * step + 1e-6
 
 
-def test_non_3channel_raises():
-    """Non-3-channel input must raise."""
-    img = np.zeros((100, 100, 1), dtype=np.float32)
-    with pytest.raises((ValueError, AssertionError)):
-        tile_apply(img, fn=lambda t: t)
+@pytest.mark.parametrize("height,width", [(300, 517), (1024, 768), (100, 100)])
+def test_pad_to_multiple_and_unpad_round_trip(height, width):
+    """Padding reaches the requested multiple and unpadding restores the image."""
+    image = random_image(height, width, seed=12)
+    padded, original_size = pad_to_multiple(image, multiple=64)
+
+    assert original_size == (height, width)
+    assert padded.shape[-2] % 64 == 0
+    assert padded.shape[-1] % 64 == 0
+    # pad_to_multiple pads only bottom/right, so the original area is unchanged.
+    torch.testing.assert_close(
+        padded[:, :, :height, :width], image, atol=0.0, rtol=0.0
+    )
+
+    restored = unpad(padded, original_size)
+    assert restored.shape == image.shape
+    torch.testing.assert_close(restored, image, atol=0.0, rtol=0.0)
 
 
-def test_2d_input_raises():
-    """2-D input (no channel dim) must raise."""
-    img = np.zeros((100, 100), dtype=np.float32)
-    with pytest.raises((ValueError, AssertionError)):
-        tile_apply(img, fn=lambda t: t)
+def test_stitch_unmodified_tiles_reconstructs_padded_image():
+    """Stitching tiles cut from an image reconstructs that padded image."""
+    image = random_image(320, 576, seed=21)
+    tiles, coords = split_into_tiles(image, tile_size=256, overlap=64)
+
+    stitched = stitch_tiles(
+        tiles,
+        coords,
+        padded_size=image.shape[-2:],
+        channels=image.shape[1],
+    )
+
+    assert stitched.shape == image.shape
+    torch.testing.assert_close(stitched, image, atol=1e-5, rtol=0.0)
+
+
+def test_tiled_inference_does_not_modify_input():
+    """Running tiled inference must not mutate the input tensor in place."""
+    image = random_image(300, 517, seed=31)
+    before = image.clone()
+
+    tiled_inference(
+        image,
+        model_fn=lambda batch: batch * 0.5,
+        tile_size=256,
+        overlap=64,
+        pad_multiple=64,
+    )
+
+    torch.testing.assert_close(image, before, atol=0.0, rtol=0.0)

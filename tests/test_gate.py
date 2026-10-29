@@ -1,306 +1,284 @@
-"""
-tests/test_gate.py
+"""Tests for the torch-based app.gate module.
 
-Tests for app.gate module: signal fusion and per-patch gating.
-
-Tests for:
-    classical_signal(noisy, denoised) -> ndarray HxW in [0, 1]
-    rank_fuse(u_learned, u_classical, w_learned=0.3, w_classical=0.7) -> ndarray HxW
-    patch_gate(combined, patch=64, cutoff_percentile=70) -> ndarray (H/64)x(W/64) in [0, 1]
-
-All tests use synthetic numpy arrays only. No weights, no GPU, no downloads.
-
-Assumptions (confirmed with implementation):
-1. classical_signal: HxWx3 -> HxW in [0,1]. Per-pixel difference is MEAN over channels.
-2. rank_fuse: HxW arrays (any range) -> HxW. Uses global percentile rank of each input.
-3. patch_gate: HxW with H,W multiples of 64 -> (H/64)x(W/64). Non-multiples raise ValueError.
-4. Shape mismatches: gate functions raise ValueError on shape mismatch (added for safety).
+All tests use synthetic CPU tensors; no model weights, GPU, or downloads are
+required. Tests assert the specified behaviour without fixing the gate ramp
+formula above the cutoff.
 """
 
-import numpy as np
 import pytest
+import torch
 
-from app.gate import classical_signal, patch_gate, rank_fuse
-
-
-# -- helpers ------------------------------------------------------------------
-
-def make_hw3(h, w, value=0.5):
-    """Create HxWx3 float32 test array."""
-    return np.full((h, w, 3), value, dtype=np.float32)
-
-
-def make_hw(h, w, value=0.5):
-    """Create HxW float32 test array."""
-    return np.full((h, w), value, dtype=np.float32)
+from app.gate import (
+    blend,
+    compute_classical_signal,
+    compute_patch_weights,
+    fuse_signals,
+    get_flagged_patch_mask,
+    normalize_per_image,
+    upsample_patch_weights,
+)
 
 
-def rng_hw(h, w, seed=0):
-    """Create HxW random float32 array in [0,1]."""
-    return np.random.default_rng(seed).random((h, w)).astype(np.float32)
+def make_nchw(height, width, value=0.5, batch=1, channels=3):
+    """Create a float32 tensor with shape (N, C, H, W)."""
+    return torch.full((batch, channels, height, width), value, dtype=torch.float32)
+
+
+def random_nchw(height, width, seed=0, batch=1, channels=1):
+    """Create a deterministic float32 tensor with values in [0, 1]."""
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    return torch.rand((batch, channels, height, width), generator=generator, dtype=torch.float32)
 
 
 def patch_grid_4x4():
-    """
-    256x256 map with 4x4 constant 64x64 patches.
-    Patch values: 0.0, 0.1, 0.2, ..., 1.5 (left-to-right, top-to-bottom).
-    Returns (combined, scores) where scores is a (4,4) array.
-    """
-    combined = np.zeros((256, 256), dtype=np.float32)
-    scores = np.zeros((4, 4), dtype=np.float32)
-    for i in range(4):
-        for j in range(4):
-            val = (i * 4 + j) * 0.1
-            combined[i * 64:(i + 1) * 64, j * 64:(j + 1) * 64] = val
-            scores[i, j] = val
+    """Create a 256x256 map with 16 distinct constant 64x64 patch scores."""
+    combined = torch.zeros((1, 1, 256, 256), dtype=torch.float32)
+    scores = torch.empty((4, 4), dtype=torch.float32)
+    for row in range(4):
+        for col in range(4):
+            value = (row * 4 + col) * 0.1
+            combined[:, :, row * 64 : (row + 1) * 64, col * 64 : (col + 1) * 64] = value
+            scores[row, col] = value
     return combined, scores
 
 
-# ==============================================================================
-# classical_signal
-# ==============================================================================
+class TestNormalizePerImage:
+    def test_output_in_zero_one_and_shape_preserved(self):
+        x = random_nchw(128, 160, seed=1, batch=2, channels=1)
+        output = normalize_per_image(x)
 
-class TestClassicalSignal:
+        assert output.shape == x.shape
+        assert torch.isfinite(output).all()
+        assert float(output.min()) >= -1e-6
+        assert float(output.max()) <= 1.0 + 1e-6
+        for item in output:
+            assert float(item.min()) == pytest.approx(0.0, abs=1e-6)
+            assert float(item.max()) == pytest.approx(1.0, abs=1e-6)
 
-    def test_output_in_0_1(self):
-        """Output must lie in [0, 1] for random inputs."""
-        noisy = np.random.default_rng(0).random((128, 128, 3)).astype(np.float32)
-        denoised = np.random.default_rng(1).random((128, 128, 3)).astype(np.float32)
-        out = classical_signal(noisy, denoised)
-        assert out.shape == (128, 128)
-        assert float(out.min()) >= 0.0 - 1e-6
-        assert float(out.max()) <= 1.0 + 1e-6
-        assert np.isfinite(out).all(), "Output contains NaN or inf"
+    def test_constant_image_does_not_produce_nan_or_inf(self):
+        x = make_nchw(128, 128, value=0.4, channels=1)
+        output = normalize_per_image(x)
 
-    def test_identical_inputs_give_zeros(self):
-        """If noisy == denoised, the signal must be all zeros."""
-        img = make_hw3(64, 64, value=0.4)
-        out = classical_signal(img, img.copy())
-        np.testing.assert_allclose(out, 0.0, atol=1e-6,
-            err_msg="Identical inputs should give all-zero classical signal.")
+        assert torch.isfinite(output).all()
+        assert float(output.min()) >= 0.0 - 1e-6
+        assert float(output.max()) <= 1.0 + 1e-6
 
-    def test_constant_difference_no_division_by_zero(self):
-        """
-        Constant difference (min == max) must not divide by zero.
-        Output must be a constant map (all pixels equal).
-        """
-        noisy = make_hw3(64, 64, value=0.8)
-        denoised = make_hw3(64, 64, value=0.3)
-        out = classical_signal(noisy, denoised)
-        assert out.shape == (64, 64)
-        assert np.isfinite(out).all(), "Output contains NaN or inf"
-        assert float(out.max() - out.min()) < 1e-6, \
-            "Constant difference should produce a constant output map."
 
-    def test_output_shape_is_hw(self):
-        """Output shape is HxW (channels averaged away)."""
-        noisy = make_hw3(50, 70)
-        denoised = make_hw3(50, 70, value=0.2)
-        out = classical_signal(noisy, denoised)
-        assert out.shape == (50, 70)
+class TestComputeClassicalSignal:
+    def test_identical_inputs_give_all_zeros(self):
+        image = random_nchw(128, 128, seed=2, channels=3)
+        output = compute_classical_signal(image, image.clone())
 
-    def test_larger_difference_higher_signal(self):
-        """Larger difference -> higher normalized signal."""
-        noisy = np.zeros((64, 64, 3), dtype=np.float32)
-        denoised = np.zeros((64, 64, 3), dtype=np.float32)
-        denoised[:, :32, :] = 0.1     # left: small difference
-        denoised[:, 32:, :] = 0.5     # right: larger difference
-        out = classical_signal(noisy, denoised)
-        left_mean = float(out[:, :32].mean())
-        right_mean = float(out[:, 32:].mean())
-        assert right_mean > left_mean, \
-            "Larger difference should produce higher classical signal."
+        assert output.shape == (1, 1, 128, 128)
+        torch.testing.assert_close(output, torch.zeros_like(output), atol=1e-6, rtol=0.0)
+
+    def test_output_shape_is_single_channel(self):
+        input_img = random_nchw(128, 160, seed=3, channels=3)
+        denoised = random_nchw(128, 160, seed=4, channels=3)
+        output = compute_classical_signal(input_img, denoised)
+
+        assert output.shape == (1, 1, 128, 160)
+        assert torch.isfinite(output).all()
+        assert float(output.min()) >= -1e-6
+        assert float(output.max()) <= 1.0 + 1e-6
+
+    def test_signal_is_symmetric_in_arguments(self):
+        first = random_nchw(128, 128, seed=5, channels=3)
+        second = random_nchw(128, 128, seed=6, channels=3)
+
+        forward = compute_classical_signal(first, second)
+        reverse = compute_classical_signal(second, first)
+        torch.testing.assert_close(forward, reverse, atol=1e-6, rtol=0.0)
 
     def test_channels_are_averaged_not_maxed(self):
-        """
-        Verify channels are averaged, not maxed.
+        """A 0.9 difference in one channel normalizes to 1/3, not 1."""
+        input_img = torch.zeros((1, 3, 128, 128), dtype=torch.float32)
+        denoised = torch.zeros_like(input_img)
 
-        Pixel A: difference [0.3, 0.0, 0.0] -> mean = 0.1
-        Pixel B: difference [0.1, 0.1, 0.1] -> mean = 0.1
-        
-        Both have the same mean, so after min-max normalization (max=0.3 globally),
-        both should get 0.1 / 0.3 = 1/3.
-        
-        If max-over-channels was used instead:
-        Pixel A: max = 0.3 -> normalized = 0.3/0.3 = 1.0
-        Pixel B: max = 0.1 -> normalized = 0.1/0.3 = 1/3
-        This would fail the assertion.
-        """
-        noisy = np.zeros((8, 8, 3), dtype=np.float32)
-        denoised = np.zeros((8, 8, 3), dtype=np.float32)
-        denoised[0, 0] = [0.3, 0.0, 0.0]    # A: mean diff = 0.1
-        denoised[0, 1] = [0.1, 0.1, 0.1]    # B: mean diff = 0.1
-        out = classical_signal(noisy, denoised)
-        
-        # Both pixels have the same mean difference, so same normalized signal.
-        expected_a = 0.1 / 0.3  # = 1/3
-        expected_b = 0.1 / 0.3  # = 1/3
-        assert out[0, 0] == pytest.approx(expected_a, abs=1e-5), \
-            f"Pixel A should be {expected_a:.4f}, got {out[0, 0]:.4f}"
-        assert out[0, 1] == pytest.approx(expected_b, abs=1e-5), \
-            f"Pixel B should be {expected_b:.4f}, got {out[0, 1]:.4f}"
-        # Untouched pixel should be 0
-        assert out[4, 4] == pytest.approx(0.0, abs=1e-5), \
-            f"Untouched pixel should be 0.0, got {out[4, 4]:.4f}"
+        # Pixel A: only channel 0 differs by 0.9; channel-mean difference = 0.3.
+        denoised[0, 0, 0, 0] = 0.9
+        # Pixel B: all three channels differ by 0.9; channel-mean difference = 0.9.
+        denoised[0, :, 0, 1] = 0.9
 
-    def test_symmetric_in_its_arguments(self):
-        """It is |noisy - denoised|, so argument order doesn't matter."""
-        a = np.random.default_rng(2).random((32, 32, 3)).astype(np.float32)
-        b = np.random.default_rng(3).random((32, 32, 3)).astype(np.float32)
-        out_ab = classical_signal(a, b)
-        out_ba = classical_signal(b, a)
-        np.testing.assert_allclose(out_ab, out_ba, atol=1e-6,
-            err_msg="classical_signal must be symmetric in its arguments")
+        output = compute_classical_signal(input_img, denoised)
 
-    def test_shape_mismatch_raises(self):
-        """Mismatched input shapes must raise ValueError."""
-        with pytest.raises((ValueError, AssertionError)):
-            classical_signal(make_hw3(32, 32), make_hw3(32, 48))
+        assert float(output[0, 0, 0, 0]) == pytest.approx(1.0 / 3.0, abs=1e-5)
+        assert float(output[0, 0, 0, 1]) == pytest.approx(1.0, abs=1e-6)
+        assert float(output[0, 0, 10, 10]) == pytest.approx(0.0, abs=1e-6)
 
 
-# ==============================================================================
-# rank_fuse
-# ==============================================================================
+class TestFuseSignals:
+    def test_weights_one_zero_depend_only_on_learned_rank(self):
+        learned = random_nchw(128, 128, seed=10, channels=1)
+        classical_a = random_nchw(128, 128, seed=11, channels=1)
+        classical_b = random_nchw(128, 128, seed=12, channels=1)
 
-class TestRankFuse:
+        out_a = fuse_signals(learned, classical_a, weight_learned=1.0, weight_classical=0.0)
+        out_b = fuse_signals(learned, classical_b, weight_learned=1.0, weight_classical=0.0)
 
-    def test_same_inputs_monotonic_in_input(self):
-        """
-        If both inputs are identical, fused result must be monotonic in input.
-        Higher input -> higher rank -> higher fused score.
-        """
-        u = rng_hw(64, 64, seed=5)
-        out = rank_fuse(u, u.copy())
-        order = np.argsort(u.ravel())
-        diffs = np.diff(out.ravel()[order])
-        assert (diffs >= -1e-6).all(), \
-            "rank_fuse output must be monotonic when both inputs are the same map."
-        assert np.isfinite(out).all(), "Output contains NaN or inf"
+        torch.testing.assert_close(out_a, out_b, atol=0.0, rtol=0.0)
+        order = torch.argsort(learned.flatten())
+        differences = torch.diff(out_a.flatten()[order])
+        assert bool(torch.all(differences >= -1e-7))
 
-    def test_weights_1_0_returns_rank_of_first(self):
-        """With w_learned=1, w_classical=0, output rank matches u_learned rank."""
-        u1 = rng_hw(32, 32, seed=10)
-        u2 = rng_hw(32, 32, seed=11)
-        out = rank_fuse(u1, u2, w_learned=1.0, w_classical=0.0)
-        rank_u1 = np.argsort(np.argsort(u1.ravel()))
-        rank_out = np.argsort(np.argsort(out.ravel()))
-        np.testing.assert_array_equal(rank_u1, rank_out,
-            err_msg="w_learned=1 output rank must equal u_learned's rank.")
+    def test_weights_zero_one_depend_only_on_classical_rank(self):
+        learned_a = random_nchw(128, 128, seed=20, channels=1)
+        learned_b = random_nchw(128, 128, seed=21, channels=1)
+        classical = random_nchw(128, 128, seed=22, channels=1)
 
-    def test_weights_0_1_returns_rank_of_second(self):
-        """With w_learned=0, w_classical=1, output rank matches u_classical rank."""
-        u1 = rng_hw(32, 32, seed=20)
-        u2 = rng_hw(32, 32, seed=21)
-        out = rank_fuse(u1, u2, w_learned=0.0, w_classical=1.0)
-        rank_u2 = np.argsort(np.argsort(u2.ravel()))
-        rank_out = np.argsort(np.argsort(out.ravel()))
-        np.testing.assert_array_equal(rank_u2, rank_out,
-            err_msg="w_classical=1 output rank must equal u_classical's rank.")
+        out_a = fuse_signals(learned_a, classical, weight_learned=0.0, weight_classical=1.0)
+        out_b = fuse_signals(learned_b, classical, weight_learned=0.0, weight_classical=1.0)
 
-    def test_output_invariant_to_monotone_transform(self):
-        """
-        Applying a strictly increasing function to one input must not change
-        the output (fusion uses only ranks).
-        """
-        u1 = rng_hw(64, 64, seed=30)
-        u2 = rng_hw(64, 64, seed=31)
-        out_orig = rank_fuse(u1, u2)
-        out_transformed = rank_fuse(u1 ** 2, u2)  # squaring is monotone on [0,1]
-        np.testing.assert_allclose(out_orig, out_transformed, atol=1e-6,
-            err_msg="Monotone transform of input must not change rank_fuse output.")
+        torch.testing.assert_close(out_a, out_b, atol=0.0, rtol=0.0)
+        order = torch.argsort(classical.flatten())
+        differences = torch.diff(out_a.flatten()[order])
+        assert bool(torch.all(differences >= -1e-7))
 
-    def test_output_shape(self):
-        """Output shape matches input shape."""
-        u1 = rng_hw(50, 70)
-        u2 = rng_hw(50, 70)
-        out = rank_fuse(u1, u2)
-        assert out.shape == (50, 70)
+    def test_output_is_invariant_to_strictly_increasing_transform(self):
+        learned = random_nchw(128, 128, seed=30, channels=1)
+        classical = random_nchw(128, 128, seed=31, channels=1)
 
-    def test_shape_mismatch_raises(self):
-        """Mismatched input shapes must raise ValueError."""
-        with pytest.raises((ValueError, AssertionError)):
-            rank_fuse(rng_hw(32, 32), rng_hw(32, 48))
+        original = fuse_signals(learned, classical)
+        transformed = fuse_signals(0.5 * learned, classical)
+        torch.testing.assert_close(original, transformed, atol=0.0, rtol=0.0)
+
+    def test_output_shape_matches_inputs(self):
+        learned = random_nchw(128, 160, seed=32, channels=1)
+        classical = random_nchw(128, 160, seed=33, channels=1)
+        output = fuse_signals(learned, classical)
+        assert output.shape == learned.shape
+        assert torch.isfinite(output).all()
 
 
-# ==============================================================================
-# patch_gate
-# ==============================================================================
+class TestComputePatchWeights:
+    def test_shape_and_range(self):
+        combined = random_nchw(256, 320, seed=40, channels=1)
+        output = compute_patch_weights(combined, patch_size=64)
 
-class TestPatchGate:
+        assert output.shape == (1, 1, 4, 5)
+        assert torch.isfinite(output).all()
+        assert float(output.min()) >= 0.0 - 1e-6
+        assert float(output.max()) <= 1.0 + 1e-6
 
-    def test_output_shape(self):
-        """Output shape is (H/64, W/64)."""
-        combined = rng_hw(256, 320)
-        out = patch_gate(combined, patch=64)
-        assert out.shape == (4, 5), f"Expected (4,5), got {out.shape}"
-
-    def test_output_in_0_1(self):
-        """Every gate weight is in [0, 1]."""
-        combined = rng_hw(256, 256)
-        out = patch_gate(combined)
-        assert float(out.min()) >= 0.0 - 1e-6
-        assert float(out.max()) <= 1.0 + 1e-6
-        assert np.isfinite(out).all(), "Output contains NaN or inf"
-
-    def test_below_cutoff_has_zero_weight(self):
-        """Patches at or below the cutoff percentile have weight 0."""
+    def test_scores_above_cutoff_get_positive_weights_and_lower_scores_get_zero(self):
         combined, scores = patch_grid_4x4()
-        out = patch_gate(combined, patch=64, cutoff_percentile=70)
-        assert out.shape == (4, 4)
-        threshold = np.percentile(scores, 70)
-        for i in range(4):
-            for j in range(4):
-                if scores[i, j] <= threshold:
-                    assert out[i, j] == pytest.approx(0.0, abs=1e-6), \
-                        f"Patch ({i},{j}) score={scores[i, j]:.2f} <= cutoff={threshold:.2f} " \
-                        f"but gate weight = {out[i, j]:.4f} (expected 0)"
+        cutoff = 0.70
+        output = compute_patch_weights(combined, patch_size=64, percentile_cutoff=cutoff)
+        weights = output[0, 0]
 
-    def test_above_cutoff_has_positive_weight(self):
-        """
-        Every patch above the cutoff must have weight > 0.
-        (This catches gates that return all zeros.)
-        """
-        combined, scores = patch_grid_4x4()
-        out = patch_gate(combined, patch=64, cutoff_percentile=70)
-        threshold = np.percentile(scores, 70)
-        above = scores > threshold
-        assert above.sum() == 5, "Sanity check: should have 5 patches above 70th percentile"
-        assert (out[above] > 0).all(), \
-            f"Patches above the cutoff must have weight > 0, got {out[above]}"
-        assert int((out > 0).sum()) == int(above.sum()), \
-            "Exactly the patches above the cutoff should be non-zero."
+        # With 16 distinct patch scores, rank positions are 0/15, ..., 15/15.
+        ordered = torch.argsort(scores.flatten())
+        ranks = torch.empty_like(ordered, dtype=torch.float32)
+        ranks[ordered] = torch.arange(16, dtype=torch.float32) / 15.0
+        ranks = ranks.view(4, 4)
+        below_or_at = ranks <= cutoff
+        above = ranks > cutoff
+
+        assert bool(torch.all(weights[below_or_at] == 0)), (
+            "Patches whose rank is at or below the cutoff must have zero weight"
+        )
+        assert int(above.sum()) == 5  # sanity check for this fixed 4x4 distinct-score grid
+        assert bool(torch.all(weights[above] > 0)), (
+            "Every patch ranked above the cutoff should get a positive weight"
+        )
+        assert int((weights > 0).sum()) == int(above.sum()), (
+            "Exactly patches above the cutoff should have non-zero weights"
+        )
 
     def test_highest_scoring_patch_has_highest_weight(self):
-        """The highest-scoring patch should have the highest weight."""
-        combined, scores = patch_grid_4x4()
-        out = patch_gate(combined, patch=64, cutoff_percentile=70)
-        assert out[3, 3] == pytest.approx(float(out.max()), abs=1e-6)
-        assert out[3, 3] > 0
+        combined, _ = patch_grid_4x4()
+        output = compute_patch_weights(combined, patch_size=64, percentile_cutoff=0.70)[0, 0]
 
-    def test_monotonically_non_decreasing(self):
-        """A larger patch score never produces a smaller weight."""
+        highest = output[3, 3]
+        assert float(highest) > 0.0
+        assert float(highest) == pytest.approx(float(output.max()), abs=1e-6)
+
+    def test_larger_patch_score_never_has_smaller_weight(self):
         combined, scores = patch_grid_4x4()
-        out = patch_gate(combined, patch=64, cutoff_percentile=70)
-        order = np.argsort(scores.ravel())
-        diffs = np.diff(out.ravel()[order])
-        assert (diffs >= -1e-6).all(), f"patch_gate is not monotone: diffs = {diffs}"
+        output = compute_patch_weights(combined, patch_size=64, percentile_cutoff=0.70)[0, 0]
+        order = torch.argsort(scores.flatten())
+        sorted_weights = output.flatten()[order]
+
+        assert bool(torch.all(torch.diff(sorted_weights) >= -1e-6))
 
     def test_constant_input_does_not_crash(self):
-        """A constant combined map must not raise (all patches same score)."""
-        combined = make_hw(128, 128, value=0.5)
-        out = patch_gate(combined, patch=64)
-        assert out.shape == (2, 2)
-        assert np.isfinite(out).all()
-        assert float(out.min()) >= 0.0 - 1e-6
-        assert float(out.max()) <= 1.0 + 1e-6
+        """The specified range/finite invariants hold for a constant map."""
+        combined = make_nchw(128, 128, value=0.5, channels=1)
+        output = compute_patch_weights(combined, patch_size=64)
+
+        assert output.shape == (1, 1, 2, 2)
+        assert torch.isfinite(output).all()
+        assert float(output.min()) >= 0.0 - 1e-6
+        assert float(output.max()) <= 1.0 + 1e-6
 
     def test_custom_patch_size(self):
-        """patch_gate respects non-default patch size."""
-        combined = rng_hw(128, 192)
-        out = patch_gate(combined, patch=32)
-        assert out.shape == (4, 6), f"Expected (4,6), got {out.shape}"
+        combined = random_nchw(128, 192, seed=41, channels=1)
+        output = compute_patch_weights(combined, patch_size=32)
+        assert output.shape == (1, 1, 4, 6)
 
-    def test_non_multiple_of_patch_raises(self):
-        """H or W not a multiple of patch must raise ValueError."""
-        with pytest.raises((ValueError, AssertionError)):
-            patch_gate(rng_hw(100, 128), patch=64)
+
+class TestUpsamplePatchWeights:
+    def test_each_weight_is_repeated_over_its_patch_block(self):
+        patch_weights = torch.tensor(
+            [[[[0.0, 0.25, 0.5], [0.75, 1.0, 0.125]]]], dtype=torch.float32
+        )
+        output = upsample_patch_weights(patch_weights, target_size=(128, 192))
+
+        assert output.shape == (1, 1, 128, 192)
+        for row in range(2):
+            for col in range(3):
+                block = output[
+                    0,
+                    0,
+                    row * 64 : (row + 1) * 64,
+                    col * 64 : (col + 1) * 64,
+                ]
+                expected = patch_weights[0, 0, row, col]
+                torch.testing.assert_close(block, expected.expand_as(block), atol=0.0, rtol=0.0)
+
+
+class TestGetFlaggedPatchMask:
+    def test_true_exactly_where_weight_exceeds_threshold(self):
+        weights = torch.tensor(
+            [[[[0.0, 0.1, 0.25], [0.3, 0.5, 1.0]]]], dtype=torch.float32
+        )
+        expected = torch.tensor(
+            [[[[False, False, False], [True, True, True]]]], dtype=torch.bool
+        )
+        output = get_flagged_patch_mask(weights, threshold=0.25)
+
+        assert output.dtype == torch.bool
+        assert output.shape == weights.shape
+        assert torch.equal(output, expected)
+
+
+class TestBlend:
+    def test_zero_weight_returns_deterministic_output_exactly(self):
+        d_det = random_nchw(128, 128, seed=50, channels=3)
+        d_gen = random_nchw(128, 128, seed=51, channels=3)
+        weights = torch.zeros((1, 1, 128, 128), dtype=torch.float32)
+
+        output = blend(d_det, d_gen, weights)
+        torch.testing.assert_close(output, d_det, atol=0.0, rtol=0.0)
+
+    def test_one_weight_returns_generative_output_exactly(self):
+        d_det = random_nchw(128, 128, seed=52, channels=3)
+        d_gen = random_nchw(128, 128, seed=53, channels=3)
+        weights = torch.ones((1, 1, 128, 128), dtype=torch.float32)
+
+        output = blend(d_det, d_gen, weights)
+        torch.testing.assert_close(output, d_gen, atol=0.0, rtol=0.0)
+
+    def test_garbage_in_zero_weight_region_does_not_change_output(self):
+        d_det = random_nchw(128, 128, seed=54, channels=3)
+        d_gen = random_nchw(128, 128, seed=55, channels=3)
+        gate = torch.zeros((1, 1, 128, 128), dtype=torch.float32)
+        gate[:, :, :, 64:] = 0.5
+
+        zero_weight_region = gate.expand_as(d_gen) == 0
+        d_gen[zero_weight_region] = 10_000.0  # finite but deliberately invalid values
+
+        output = blend(d_det, d_gen, gate)
+        torch.testing.assert_close(
+            output[:, :, :, :64], d_det[:, :, :, :64], atol=0.0, rtol=0.0
+        )
