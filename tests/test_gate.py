@@ -90,6 +90,12 @@ class TestComputeClassicalSignal:
         reverse = compute_classical_signal(second, first)
         torch.testing.assert_close(forward, reverse, atol=1e-6, rtol=0.0)
 
+    def test_constant_difference_gives_finite_constant_map(self):
+        output = compute_classical_signal(make_nchw(64, 64, value=0.8), make_nchw(64, 64, value=0.3))
+
+        assert torch.isfinite(output).all()
+        assert float(output.max() - output.min()) < 1e-6
+
     def test_channels_are_averaged_not_maxed(self):
         """A 0.9 difference in one channel normalizes to 1/3, not 1."""
         input_img = torch.zeros((1, 3, 128, 128), dtype=torch.float32)
@@ -142,6 +148,14 @@ class TestFuseSignals:
         transformed = fuse_signals(0.5 * learned, classical)
         torch.testing.assert_close(original, transformed, atol=0.0, rtol=0.0)
 
+    def test_default_weights_are_0_3_learned_and_0_7_classical(self):
+        """Learned rank 1 / classical rank 0 scores 0.3; learned 0 / classical 1 scores 0.7."""
+        ramp = torch.arange(100, dtype=torch.float32).view(1, 1, 1, 100)
+        output = fuse_signals(ramp, ramp.flip(-1))
+
+        assert float(output[0, 0, 0, 99]) == pytest.approx(0.3, abs=1e-6)
+        assert float(output[0, 0, 0, 0]) == pytest.approx(0.7, abs=1e-6)
+
     def test_output_shape_matches_inputs(self):
         learned = random_nchw(128, 160, seed=32, channels=1)
         classical = random_nchw(128, 160, seed=33, channels=1)
@@ -192,6 +206,34 @@ class TestComputePatchWeights:
         highest = output[3, 3]
         assert float(highest) > 0.0
         assert float(highest) == pytest.approx(float(output.max()), abs=1e-6)
+
+    def test_top_patch_reaches_full_weight(self):
+        """The ramp runs from 0 at the cutoff up to 1 for the highest-scoring patch."""
+        combined, _ = patch_grid_4x4()
+        output = compute_patch_weights(combined, patch_size=64, percentile_cutoff=0.70)[0, 0]
+
+        assert float(output[3, 3]) == pytest.approx(1.0, abs=1e-6)
+
+    def test_defaults_are_64_px_patches_and_cutoff_0_70(self):
+        combined = random_nchw(256, 256, seed=42, channels=1)
+
+        default = compute_patch_weights(combined)
+        explicit = compute_patch_weights(combined, patch_size=64, percentile_cutoff=0.70)
+
+        assert default.shape == (1, 1, 4, 4)
+        torch.testing.assert_close(default, explicit, atol=0.0, rtol=0.0)
+
+    def test_patch_score_is_the_mean_not_the_max(self):
+        """A single bright pixel must not outrank a patch that is brighter on average."""
+        combined = torch.zeros((1, 1, 128, 128), dtype=torch.float32)
+        combined[:, :, :64, :64] = 0.5  # A: highest mean
+        combined[0, 0, 0, 64] = 1.0  # B: one spike, lowest mean (highest max)
+        combined[:, :, 64:, :64] = 0.2  # C
+        combined[:, :, 64:, 64:] = 0.1  # D
+        weights = compute_patch_weights(combined, patch_size=64, percentile_cutoff=0.70)[0, 0]
+
+        assert float(weights[0, 0]) > 0.0
+        assert float(weights[0, 1]) == 0.0
 
     def test_larger_patch_score_never_has_smaller_weight(self):
         combined, scores = patch_grid_4x4()

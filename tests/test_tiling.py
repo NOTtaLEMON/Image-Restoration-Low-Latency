@@ -9,6 +9,7 @@ import torch
 
 from app.tiling import (
     pad_to_multiple,
+    run_model_on_tiles,
     split_into_tiles,
     stitch_tiles,
     tiled_inference,
@@ -228,6 +229,49 @@ def test_stitch_unmodified_tiles_reconstructs_padded_image():
 
     assert stitched.shape == image.shape
     torch.testing.assert_close(stitched, image, atol=1e-5, rtol=0.0)
+
+
+def test_single_channel_model_output_keeps_input_size():
+    """UMapNet maps 3 channels to 1; the output channel count must follow the model."""
+    image = random_image(300, 517, seed=61)
+    output = tiled_inference(
+        image,
+        model_fn=lambda batch: batch.mean(dim=1, keepdim=True),
+        tile_size=256,
+        overlap=64,
+        pad_multiple=64,
+    )
+
+    assert output.shape == (1, 1, 300, 517)
+    torch.testing.assert_close(output, image.mean(dim=1, keepdim=True), atol=1e-5, rtol=0.0)
+
+
+def test_run_model_on_tiles_keeps_order_when_batch_size_does_not_divide_count():
+    tiles = [torch.full((1, 3, 8, 8), float(i)) for i in range(5)]
+    outputs = run_model_on_tiles(lambda batch: batch + 100, tiles, batch_size=2)
+
+    assert len(outputs) == 5
+    for i, tile in enumerate(outputs):
+        assert tile.shape == (1, 3, 8, 8)
+        assert bool(torch.all(tile == i + 100))
+
+
+def test_stitching_a_subset_of_tiles_leaves_the_rest_zero():
+    """pipeline.py runs IR-SDE on only some tiles and stitches just those."""
+    image = random_image(576, 576, seed=71)
+    tiles, coords = split_into_tiles(image, tile_size=256, overlap=64)
+    keep = [i for i, origin in enumerate(coords) if origin == (0, 0)]
+
+    stitched = stitch_tiles(
+        [tiles[i] for i in keep],
+        [coords[i] for i in keep],
+        padded_size=image.shape[-2:],
+        channels=3,
+    )
+
+    torch.testing.assert_close(stitched[:, :, :256, :256], image[:, :, :256, :256], atol=1e-5, rtol=0.0)
+    assert bool(torch.all(stitched[:, :, 256:, :] == 0))
+    assert bool(torch.all(stitched[:, :, :, 256:] == 0))
 
 
 def test_tiled_inference_does_not_modify_input():
