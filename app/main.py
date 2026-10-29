@@ -2,7 +2,12 @@
 restored image, as newline-delimited JSON. Serves static/ at /.
 
 Each line of the response is one JSON object:
+  {"progress": {"stage": "queued"}, "t_ms": int}  another upload is still running; this one waits
+  {"progress": {"stage": "denoise"}, "t_ms": int} NAFNet started
+  {"progress": {"stage": "umap"}, "t_ms": int}    UMapNet started
   {"umap": <base64 PNG>, "t_umap_ms": int}        as soon as the u-map is ready
+  {"progress": {"stage": "diffuse", "done": k, "total": n}, "t_ms": int}
+                                                  IR-SDE progress, after each batch of patches
   {"restored": <base64 PNG>, "t_total_ms": int}   when the restored image is ready
   {"error": str}                                  if something fails after streaming has started
 Times are measured from when the upload arrives and include PNG encoding.
@@ -63,20 +68,29 @@ async def restore(file: UploadFile = File(...)):
 
 
 def _stream(image, start):
-    with _busy:
-        try:
-            for stage, result in pipeline.restore(image):
-                if stage == "umap":
-                    body = {"umap": _png_b64(_heatmap(result))}
-                    key = "t_umap_ms"
-                else:
-                    body = {"restored": _png_b64(_to_uint8(result))}
-                    key = "t_total_ms"
-                body[key] = round((time.perf_counter() - start) * 1000)
-                yield json.dumps(body) + "\n"
-        except Exception as exc:
-            log.exception("restoration failed")
-            yield json.dumps({"error": str(exc)}) + "\n"
+    def ms():
+        return round((time.perf_counter() - start) * 1000)
+
+    # Tell the page it is waiting rather than stuck, if another restoration holds the lock.
+    if not _busy.acquire(blocking=False):
+        yield json.dumps({"progress": {"stage": "queued"}, "t_ms": ms()}) + "\n"
+        _busy.acquire()
+    try:
+        for kind, result in pipeline.restore(image):
+            if kind == "progress":
+                body = {"progress": result, "t_ms": ms()}
+            elif kind == "umap":
+                body = {"umap": _png_b64(_heatmap(result))}
+                body["t_umap_ms"] = ms()
+            else:
+                body = {"restored": _png_b64(_to_uint8(result))}
+                body["t_total_ms"] = ms()
+            yield json.dumps(body) + "\n"
+    except Exception as exc:
+        log.exception("restoration failed")
+        yield json.dumps({"error": str(exc)}) + "\n"
+    finally:
+        _busy.release()
 
 
 def _decode(data):

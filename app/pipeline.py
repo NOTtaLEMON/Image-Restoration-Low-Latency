@@ -78,8 +78,14 @@ def warm_up():
 
 
 def restore(image):
-    """Generator: yields ("umap", HxW array in [0, 1]) as soon as it exists, then
-    ("restored", HxWx3 array in [0, 1]). Both have the input's height and width.
+    """Generator of (kind, value) pairs, in this order:
+      ("progress", {"stage": "denoise"})                       NAFNet starts
+      ("progress", {"stage": "umap"})                          UMapNet starts
+      ("umap", HxW array in [0, 1])                            the fused u-map
+      ("progress", {"stage": "diffuse", "done": k, "total": n})  IR-SDE, after each batch of patches
+                                                               (absent when no patch is flagged)
+      ("restored", HxWx3 array in [0, 1])                      the final image
+    Both images have the input's height and width.
     """
     _require_loaded()
     x = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).contiguous()
@@ -87,9 +93,11 @@ def restore(image):
     # so the patch grid lines up with the pixels; crop back at the end.
     padded, original_size = pad_to_multiple(x, PATCH_SIZE)
 
+    yield "progress", {"stage": "denoise"}
     t0 = time.perf_counter()
     d_det = _tiled(padded, _denoise, BATCH_SIZE)
     t_nafnet = time.perf_counter()
+    yield "progress", {"stage": "umap"}
     u_learned = _tiled(padded, _umap, BATCH_SIZE)
     t_umapnet = time.perf_counter()
     u_classical = compute_classical_signal(padded, d_det)
@@ -113,7 +121,7 @@ def restore(image):
         return
 
     t_irsde = time.perf_counter()
-    d_gen = _diffuse_patches(padded, flagged, original_size)
+    d_gen = yield from _diffuse_patches(padded, flagged, original_size)
     log.info(
         "IR-SDE: %d of %d patches in %.1f s",
         int(flagged.sum()), flagged.numel(), time.perf_counter() - t_irsde,
@@ -129,8 +137,10 @@ def _tiled(padded, model_fn, batch_size):
 
 
 def _diffuse_patches(padded, flagged, original_size):
-    """Run IR-SDE once per flagged patch and return D_gen; unflagged patches stay zero.
+    """Run IR-SDE once per flagged patch; unflagged patches of D_gen stay zero.
 
+    A generator: yields ("progress", ...) after every batch of windows so the page can show
+    how far IR-SDE has got, and RETURNS D_gen (the caller uses `d_gen = yield from ...`).
     blend() multiplies D_gen by the patch weight, which is zero exactly where no patch was
     restored, so the zeros never reach the output.
     """
@@ -150,8 +160,14 @@ def _diffuse_patches(padded, flagged, original_size):
         windows.append(padded[:, :, wy : wy + win_h, wx : wx + win_w])
         placements.append((py, px, py - wy, px - wx))
 
+    outputs = []
+    yield "progress", {"stage": "diffuse", "done": 0, "total": len(windows)}
+    for start in range(0, len(windows), IRSDE_BATCH_SIZE):
+        batch = windows[start : start + IRSDE_BATCH_SIZE]
+        outputs.extend(run_model_on_tiles(_diffuse, batch, batch_size=IRSDE_BATCH_SIZE))
+        yield "progress", {"stage": "diffuse", "done": len(outputs), "total": len(windows)}
+
     d_gen = torch.zeros_like(padded)
-    outputs = run_model_on_tiles(_diffuse, windows, batch_size=IRSDE_BATCH_SIZE)
     for out, (py, px, oy, ox) in zip(outputs, placements):
         d_gen[:, :, py : py + PATCH_SIZE, px : px + PATCH_SIZE] = out[:, :, oy : oy + PATCH_SIZE, ox : ox + PATCH_SIZE]
     return d_gen

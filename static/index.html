@@ -1,53 +1,136 @@
 <!DOCTYPE html>
 <!--
   Single page served by app/main.py at "/". No build step, no frameworks.
-  Files: this page (structure), style.css (look), app.js (behaviour).
-  app.js finds elements by the ids below, so keep the ids if you restyle or rearrange the page.
-  Flow: the user picks an image, app.js POSTs it to /restore, and the server streams back
-  the u-map first and the restored image later (see the header of app.js for the format).
+  Files: this page (structure), style.css (look: the "Industrial" instrument style), app.js (behaviour).
+  app.js finds elements by their ids, so keep the ids if you restyle or rearrange the page.
+  Flow: the user picks an image, app.js POSTs it to /restore, and the server streams back progress
+  events, the u-map, then the restored image (see the header of app.js for the format).
+
+  Layout: one rounded "housing" with three numbered bays:
+    01  heading + controls (file key, circular Restore dial)
+    02  status screen: step lamps, progress bar, elapsed timer, error bar
+    03  results: original, u-map and restored image in recessed wells
+  Vents and screws are decorative (aria-hidden); every lamp and number on the status screen is real state.
 -->
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Image Restoration</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Host+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <main>
-    <h1>Image Restoration</h1>
-    <p class="intro">Upload a noisy photo. You get the u-map (where the denoiser is unsure) first, then the restored image.</p>
+  <div class="housing">
+    <span class="screw screw--tl" aria-hidden="true"></span>
+    <span class="screw screw--tr" aria-hidden="true"></span>
+    <span class="screw screw--bl" aria-hidden="true"></span>
+    <span class="screw screw--br" aria-hidden="true"></span>
 
-    <!-- Upload form. app.js intercepts the submit; the file field is sent to the server as "file". -->
-    <form id="upload-form">
-      <input id="file-input" name="file" type="file" accept="image/*" required>
-      <button id="restore-button" type="submit">Restore</button>
-    </form>
+    <main>
+      <!-- Bay 01: heading and controls -->
+      <section class="bay bay--opening" aria-labelledby="title">
+        <span class="bay-number" aria-hidden="true">01</span>
+        <div class="opening-text">
+          <p class="label">Gated NAFNet + IR-SDE · SIDD</p>
+          <h1 id="title">Image Restoration</h1>
+          <p class="intro">Upload a noisy photo. The u-map (where the denoiser is unsure) arrives first; the restored image follows once the diffusion model has worked through the uncertain patches.</p>
+        </div>
 
-    <!-- Status line: progress text and error messages (app.js writes into it). -->
-    <p id="status" role="status"></p>
+        <!-- app.js intercepts the submit; the file field is sent to the server as "file". -->
+        <form id="upload-form" class="controls">
+          <div class="vents" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span></div>
 
-    <!-- Three result panels. Each has a placeholder that app.js hides once the image arrives. -->
-    <section class="panels">
-      <figure>
-        <figcaption>Original</figcaption>
-        <p class="placeholder" id="original-placeholder">No image chosen</p>
-        <img id="original-img" alt="Original image" hidden>
-      </figure>
+          <label class="key file-key">
+            <input id="file-input" name="file" type="file" accept="image/*" required>
+            <span class="key-label">Choose image</span>
+            <span class="file-name" id="file-name">No file chosen</span>
+          </label>
 
-      <figure>
-        <figcaption>U-map <span class="time" id="umap-time"></span></figcaption>
-        <p class="placeholder" id="umap-placeholder">Waiting</p>
-        <img id="umap-img" alt="U-map: brighter means more uncertain" hidden>
-      </figure>
+          <button id="restore-button" class="dial" type="submit">
+            <span class="dial-symbol" aria-hidden="true">▶</span>
+            <span class="dial-text">Restore</span>
+          </button>
+        </form>
+      </section>
 
-      <figure>
-        <figcaption>Restored <span class="time" id="restored-time"></span></figcaption>
-        <p class="placeholder" id="restored-placeholder">Waiting</p>
-        <img id="restored-img" alt="Restored image" hidden>
-      </figure>
-    </section>
-  </main>
+      <!-- Bay 02: status screen. Every value here comes from the server's progress events. -->
+      <section class="bay" aria-labelledby="status-heading">
+        <span class="bay-number" aria-hidden="true">02</span>
+        <h2 id="status-heading" class="label">Status</h2>
+
+        <div class="screen">
+          <ol class="steps" id="steps">
+            <li data-step="denoise"><span class="lamp" aria-hidden="true"></span>Denoise<span class="step-state">waiting</span></li>
+            <li data-step="umap"><span class="lamp" aria-hidden="true"></span>U-map<span class="step-state">waiting</span></li>
+            <li data-step="diffuse"><span class="lamp" aria-hidden="true"></span>Diffusion<span class="step-state">waiting</span></li>
+            <li data-step="done"><span class="lamp" aria-hidden="true"></span>Done<span class="step-state">waiting</span></li>
+          </ol>
+
+          <div class="meter">
+            <div class="meter-head">
+              <span id="meter-label">Diffusion patches</span>
+              <span id="meter-count">0 / 0</span>
+            </div>
+            <div class="track" id="progress" role="progressbar" aria-labelledby="meter-label" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+              <div class="fill" id="progress-fill"></div>
+            </div>
+          </div>
+
+          <dl class="readout">
+            <div><dt>Elapsed</dt><dd id="elapsed">0 s</dd></div>
+            <div><dt>Last update</dt><dd id="last-update">–</dd></div>
+            <div><dt>Time left (est.)</dt><dd id="eta">–</dd></div>
+          </dl>
+
+          <p id="status" class="status" role="status">Choose an image and press Restore.</p>
+        </div>
+
+        <!-- Error bar: hidden until something fails (app.js fills it in). -->
+        <div class="error-bar" id="error-bar" role="alert" hidden>
+          <span class="lamp lamp--on" aria-hidden="true"></span>
+          <span class="label">Error</span>
+          <span id="error-text"></span>
+        </div>
+      </section>
+
+      <!-- Bay 03: results. Each well shows a placeholder until its image arrives. -->
+      <section class="bay" aria-labelledby="results-heading">
+        <span class="bay-number" aria-hidden="true">03</span>
+        <h2 id="results-heading" class="label">Results</h2>
+        <div class="panels">
+          <figure>
+            <figcaption class="label">Original</figcaption>
+            <div class="well">
+              <p class="placeholder" id="original-placeholder">No image chosen</p>
+              <img id="original-img" alt="Original image" hidden>
+            </div>
+          </figure>
+
+          <figure>
+            <figcaption class="label">U-map <span class="time" id="umap-time"></span></figcaption>
+            <div class="well">
+              <p class="placeholder" id="umap-placeholder">Waiting</p>
+              <img id="umap-img" alt="U-map: brighter means more uncertain" hidden>
+            </div>
+          </figure>
+
+          <figure>
+            <figcaption class="label">Restored <span class="time" id="restored-time"></span></figcaption>
+            <div class="well">
+              <p class="placeholder" id="restored-placeholder">Waiting</p>
+              <img id="restored-img" alt="Restored image" hidden>
+            </div>
+            <a id="download-link" class="key download-key" download="restored.png" hidden>Download PNG</a>
+          </figure>
+        </div>
+      </section>
+    </main>
+
+    <footer class="label">Runs on the server's CPU or GPU · images are not stored</footer>
+  </div>
 
   <script src="app.js"></script>
 </body>
